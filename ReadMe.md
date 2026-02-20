@@ -6,7 +6,8 @@ A Gradio app that lets you chat with an LLM (Groq) and get a text reply plus a *
 
 - **Chat**: Send a message and optional system context; pick a Groq model and conversation tone.
 - **Text response**: The chatbot replies using Swarmauri (SimpleConversationAgent + MaxSystemContextConversation).
-- **Avatar video**: The reply is sent to the Tavus API; after generation completes, the video is shown in the UI (with polling).
+- **Optional avatar video**: Check "Generate avatar video" to send the reply to Tavus and show the video when ready (polling). Uncheck for text-only replies.
+- **Structured code**: Config (`config.py`), Tavus client (`tavus_client.py`), and agent logic (`agent_service.py`) are separate from the Gradio UI (`app.py`) for easier testing and maintenance.
 
 ## Requirements
 
@@ -30,7 +31,7 @@ A Gradio app that lets you chat with an LLM (Groq) and get a text reply plus a *
 
 3. **Install dependencies**
    ```bash
-   pip install gradio python-dotenv requests swarmauri
+   pip install -r requirements.txt
    ```
 
 4. **Configure environment**
@@ -54,13 +55,14 @@ The app runs at `http://127.0.0.1:7860` and prints a public Gradio share URL. Op
 
 ## Usage
 
-1. **Your Input**: Type your message.
-2. **System Context**: Optional instructions or context for the chatbot.
-3. **Model Name**: Choose a Groq model from the dropdown.
-4. **Conversation Tone**: e.g. Friendly, Formal, Neutral, Professional.
-5. Submit; you get the text reply and, after Tavus finishes, the avatar video.
+1. **Your message**: Type your question or prompt.
+2. **System context**: Optional instructions (e.g. "You are a helpful assistant.").
+3. **Model**: Choose a Groq model from the dropdown.
+4. **Tone**: e.g. Friendly, Formal, Neutral, Professional.
+5. **Generate avatar video**: Check to request a Tavus speaking-avatar video of the reply; uncheck for text-only.
+6. Click **Send**; you get the text reply and, if video was requested, the video when ready.
 
-Video generation can take a few minutes; the UI polls every 10 seconds for up to 20 minutes.
+Video generation can take a few minutes; the app polls every 10 seconds for up to 20 minutes. Logs go to the terminal (level set by config).
 
 ## Troubleshooting
 
