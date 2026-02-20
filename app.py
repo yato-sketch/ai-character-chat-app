@@ -1,142 +1,178 @@
-import os
+"""
+Gradio UI for the System Context Conversation Bot with Speaking Avatar.
+"""
+import logging
+from typing import Any, Generator, Optional
+
 import gradio as gr
-import importlib
-import requests
-import time
-from typing import TYPE_CHECKING
 
-from dotenv import load_dotenv
+from agent_service import get_available_models, run_conversation
+from config import get_config
+from tavus_client import TavusClient
 
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TAVUS_API_KEY = os.getenv("TAVUS_API_KEY")
-TAVUS_REPLICA_ID = os.getenv("TAVUS_REPLICA_ID")
+# Configure logging before other imports that may log
+logging.basicConfig(
+    level=getattr(logging, get_config().log_level.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-if not GROQ_API_KEY or not TAVUS_API_KEY:
-    raise ValueError("One or more API keys are missing. Please set them in your .env file.")
-
-if TYPE_CHECKING:
-    from swarmauri.agents import SimpleConversationAgent  # type: ignore[import-untyped]
-    from swarmauri.conversations import MaxSystemContextConversation  # type: ignore[import-untyped]
-    from swarmauri.llms import GroqModel  # type: ignore[import-untyped]
-    from swarmauri.messages import SystemMessage  # type: ignore[import-untyped]
-
-_modules_map = {
-    "GroqModel": "swarmauri.llms.GroqModel",
-    "SystemMessage": "swarmauri.messages.SystemMessage",
-    "SimpleConversationAgent": "swarmauri.agents.SimpleConversationAgent",
-    "MaxSystemContextConversation": "swarmauri.conversations.MaxSystemContextConversation",
-}
-for _name, _module_path in _modules_map.items():
-    _mod = importlib.import_module(_module_path)
-    globals()[_name] = getattr(_mod, _name)
-
-llm = GroqModel(api_key=GROQ_API_KEY)
-allowed_models = llm.allowed_models if llm.allowed_models else ["default-model"]
+# Constants for UI
+TONE_CHOICES = [
+    "Friendly", "Formal", "Casual", "Neutral", "Professional",
+    "Empathetic", "Humorous", "Angry", "Romantic",
+]
+DEFAULT_TONE = "Neutral"
 
 
-def load_model(selected_model):
+def _converse(
+    input_text: str,
+    system_context: str,
+    model_name: str,
+    tone: str,
+    generate_video: bool,
+) -> Generator[tuple[Any, Any], None, None]:
+    """
+    One turn: run conversation, optionally queue video and poll until ready.
+    Yields (text_output, video_component_update) for progressive UI updates.
+    """
+    # 1) Run LLM conversation
+    result_text, err = run_conversation(
+        user_input=input_text or "",
+        system_context=system_context or "",
+        model_name=model_name,
+        tone=tone or DEFAULT_TONE,
+    )
+    if err:
+        yield result_text or err, gr.update(value=None, label=err, visible=True)
+        return
+    if not result_text:
+        yield "No response from the model.", gr.update(value=None, visible=True)
+        return
+
+    # 2) Optional video
+    if not generate_video:
+        yield result_text, gr.update(value=None, visible=False)
+        return
+
+    client = TavusClient()
+    create_result = client.create_video(result_text)
+    if create_result.error:
+        yield result_text, gr.update(
+            value=None, label=f"Video: {create_result.error}", visible=True
+        )
+        return
+
+    # Show loading state
+    yield result_text, gr.update(
+        value="Video is being generated, please wait...",
+        visible=True,
+    )
+
+    # Poll until ready or terminal state
+    for status_result in client.wait_for_video(create_result.status_url):
+        if status_result.status == "ready" and status_result.download_url:
+            yield result_text, gr.update(
+                value=status_result.download_url, visible=True
+            )
+            return
+        if status_result.status in ("error", "deleted"):
+            msg = status_result.status_details or f"Video {status_result.status}"
+            logger.warning("Video failed: %s", msg)
+            yield result_text, gr.update(value=None, label=msg, visible=True)
+            return
+        if status_result.status == "timeout":
+            yield result_text, gr.update(
+                value=None,
+                label=status_result.status_details or "Video generation timed out.",
+                visible=True,
+            )
+            return
+        # Still generating
+        logger.debug("Video status: %s", status_result.status)
+
+
+def _build_interface() -> gr.Blocks:
+    """Build and return the Gradio interface."""
     try:
-        return GroqModel(api_key=GROQ_API_KEY, name=selected_model)
+        models = get_available_models()
     except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
+        logger.warning("Could not load models: %s", e)
+        models = ["default-model"]
+
+    with gr.Blocks(
+        title="Conversation Bot with Speaking Avatar",
+        theme=gr.themes.Soft(),
+    ) as demo:
+        gr.Markdown(
+            "## System Context Conversation Bot with Speaking Avatar\n"
+            "Chat with the model and optionally get a speaking-avatar video of the reply."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                input_text = gr.Textbox(
+                    label="Your message",
+                    placeholder="Type your message here...",
+                    lines=3,
+                )
+                system_context = gr.Textbox(
+                    label="System context (optional)",
+                    placeholder="e.g. You are a helpful assistant.",
+                    lines=2,
+                )
+                model_name = gr.Dropdown(
+                    label="Model",
+                    choices=models,
+                    value=models[0] if models else "default-model",
+                )
+                tone = gr.Dropdown(
+                    label="Tone",
+                    choices=TONE_CHOICES,
+                    value=DEFAULT_TONE,
+                )
+                generate_video = gr.Checkbox(
+                    label="Generate avatar video (Tavus)",
+                    value=True,
+                )
+                submit_btn = gr.Button("Send", variant="primary")
+
+            with gr.Column(scale=1):
+                response_text = gr.Textbox(
+                    label="Chatbot response",
+                    lines=10,
+                    interactive=False,
+                )
+                video_out = gr.Video(
+                    label="Avatar video",
+                    autoplay=True,
+                    visible=True,
+                )
+
+        submit_btn.click(
+            fn=_converse,
+            inputs=[
+                input_text,
+                system_context,
+                model_name,
+                tone,
+                generate_video,
+            ],
+            outputs=[response_text, video_out],
+        )
+
+    return demo
 
 
-def generate_avatar_video(text):
-    try:
-        script = (text or "").strip()
-        if not script:
-            print("Video generation skipped: script is empty.")
-            return None, None
-        url = "https://tavusapi.com/v2/videos"
-        payload = {"replica_id": TAVUS_REPLICA_ID, "script": script}
-        headers = {"x-api-key": TAVUS_API_KEY, "Content-Type": "application/json"}
-        response = requests.post(url, json=payload, headers=headers)
-        try:
-            response_data = response.json()
-        except Exception:
-            response_data = {}
-        if not response.ok:
-            msg = response_data.get("error") or response_data.get("message") or response.reason or f"HTTP {response.status_code}"
-            print(f"Tavus API error: {msg}")
-            return None, None
-        if response_data.get("status") != "queued":
-            msg = response_data.get("error") or response_data.get("message") or f"Unexpected status: {response_data.get('status')}"
-            print(f"Failed to queue video generation: {msg}")
-            return None, None
-        video_id = response_data.get("video_id")
-        if not video_id:
-            print("Failed to queue video: no video_id in response.")
-            return None, None
-        video_check_url = f"https://tavusapi.com/v2/videos/{video_id}"
-        return video_id, video_check_url
-    except Exception as e:
-        print(f"Error generating avatar video: {e}")
-        return None, None
+def main() -> None:
+    """Run the Gradio app."""
+    demo = _build_interface()
+    demo.launch(
+        share=True,
+        debug=True,
+        server_name="0.0.0.0",
+    )
 
 
-def converse(input_text, system_context, model_name, tone):
-    conversation = MaxSystemContextConversation()
-    llm = load_model(model_name)
-    if not llm:
-        return "Error loading language model.", gr.update(value=None)
-    # Initialize conversation agent
-    agent = SimpleConversationAgent(llm=llm, conversation=conversation)
-    agent.conversation.system_context = SystemMessage(content=f"{system_context}\nTone: {tone}")
-    result = agent.exec(input_text)
-    # Generate avatar video
-    video_id, video_check_url = generate_avatar_video(result)
-    if not video_id:
-        return result, gr.update(value=None, label="Error generating video.")
-    # Initial response with loading message
-    loading_message = gr.update(value="Video is being generated, please wait...", visible=True)
-    yield result, loading_message
-    # Poll for video status (max 20 minutes), every 10 seconds
-    headers = {"x-api-key": TAVUS_API_KEY}
-    poll_interval = 10
-    max_wait_seconds = 20 * 60  # 20 minutes
-    elapsed = 0
-    while elapsed < max_wait_seconds:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        try:
-            status_response = requests.get(video_check_url, headers=headers).json()
-        except Exception as e:
-            print(f"Error checking video status: {e}")
-            yield result, gr.update(value=None, label="Error checking video status.", visible=True)
-            return
-        status = status_response.get("status")
-        print(f"Video status: {status}")
-        if status == "ready":
-            download_url = status_response.get("download_url")
-            if not download_url:
-                yield result, gr.update(value=None, label="Video ready but no download URL.", visible=True)
-                return
-            yield result, gr.update(value=download_url, visible=True)
-            return
-        if status in ("error", "deleted"):
-            msg = status_response.get("status_details") or f"Video status: {status}"
-            print(msg)
-            yield result, gr.update(value=None, label=msg, visible=True)
-            return
-        print("Video generation in progress...")
-    yield result, gr.update(value=None, label="Video generation timed out.", visible=True)
-
-
-with gr.Interface(
-    fn=converse,
-    inputs=[
-        gr.Textbox(label="Your Input", placeholder="Type your message here..."),
-        gr.Textbox(label="System Context", placeholder="Enter the system context..."),
-        gr.Dropdown(label="Model Name", choices=allowed_models, value=allowed_models[0]),
-        gr.Dropdown(label="Conversation Tone", choices=["Friendly", "Formal", "Casual", "Neutral", "Professional", "Empathetic", "Humorous", "Angry", "Romantic"], value="Neutral")
-    ],
-    outputs=[
-        gr.Textbox(label="Chatbot Response"),
-        gr.Video(label="Avatar Video", autoplay=True)
-    ],
-    title="System Context Conversation Bot with Speaking Avatar",
-    description="Interact with the chatbot, and receive a lifelike video response."
-) as demo:
-    demo.launch(share=True, debug=True)
+if __name__ == "__main__":
+    main()
